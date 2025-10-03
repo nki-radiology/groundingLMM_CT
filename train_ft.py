@@ -1,5 +1,5 @@
 """
-train_ft.py - GLaMM Training on Single Dataset Type
+train.py - GLaMM Training on Single Dataset Type
 
 Trains the GLaMM model on one dataset type (Caption, Region, or Segmentation) at a time, iterating thoroughly through
 the chosen dataset. This targeted approach is optimal for specialized training on specific downstream task.
@@ -9,6 +9,8 @@ import sys
 import time
 import tqdm
 import random
+import re
+import matplotlib.pyplot as plt
 import torch
 import argparse
 import deepspeed
@@ -18,12 +20,13 @@ from functools import partial
 from torch.utils.data import ConcatDataset
 from peft import LoraConfig, get_peft_model
 from torch.utils.tensorboard import SummaryWriter
+from scipy.ndimage import binary_erosion, distance_transform_edt
 
 from model.GLaMM import GLaMMForCausalLM
 from model.llava import conversation as conversation_lib
 
 from dataset.dataset import custom_collate_fn
-from tools.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, AverageMeter, ProgressMeter, dict_to_cuda,
+from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, AverageMeter, ProgressMeter, dict_to_cuda,
                          Summary, intersectionAndUnionGPU)
 
 from dataset.gcg_datasets.GranDf_gcg_ds import GranDfDataset, OpenPsgGCGDataset, Flickr30kGCGDataset, RefCOCOgGCGDataset
@@ -40,7 +43,8 @@ def parse_args(args):
     parser = argparse.ArgumentParser(description="GLaMM Model Training")
 
     # Model-specific settings
-    parser.add_argument("--version", default="MBZUAI/GLaMM-GranD-Pretrained")
+    # CHANGED
+    parser.add_argument("--version", default="/projects/ct_vision_language/GLaMM-FullScope")
     parser.add_argument("--vision_pretrained", default="./checkpoints/sam_vit_h_4b8939.pth", type=str)
     parser.add_argument("--vision-tower", default="openai/clip-vit-large-patch14-336", type=str)
     parser.add_argument("--conv_type", default="llava_v1", type=str, choices=["llava_v1", "llava_llama_2"])
@@ -51,10 +55,11 @@ def parse_args(args):
     parser.add_argument("--image_size", default=1024, type=int, help="Image size for grounding image encoder")
     parser.add_argument("--model_max_length", default=1536, type=int)
     parser.add_argument("--lora_target_modules", default="q_proj,v_proj", type=str)
-    parser.add_argument("--with_region", action="store_true", default=True)
+    parser.add_argument("--with_region", action="store_true", default=False)
     parser.add_argument("--mm_vision_select_layer", default=-2, type=int)
     parser.add_argument("--pretrain_mm_mlp_adapter", default="", type=str)
     parser.add_argument("--precision", default='bf16', type=str)
+    parser.add_argument("--compute_sam_and_clip", action="store_true")
 
     # Dataset settings
     parser.add_argument("--use_cap_data", action="store_true", help="Use caption data")
@@ -69,6 +74,7 @@ def parse_args(args):
     parser.add_argument("--reg_sample_rates", default="1,1,1,1", type=str)
     parser.add_argument("--cap_dataset", default="CocoCap||LLaVaInstruct", type=str, help="Choose from: CocoCap, LLaVaInstruct")
     parser.add_argument("--cap_sample_rates", default="1,1", type=str)
+    # CHANGED
     parser.add_argument("--semantic_segm_data", default="ade20k||cocostuff||pascal_part||paco_lvis||mapillary", type=str)
     parser.add_argument("--refer_segm_data", default="refcoco||refcoco+||refcocog||refclef", type=str)
     parser.add_argument("--vqa_data", default="llava_instruct_150k", type=str)
@@ -81,7 +87,8 @@ def parse_args(args):
     parser.add_argument("--weight", default="", type=str)
     parser.add_argument("--lr", default=0.0003, type=float)
     parser.add_argument("--epochs", default=10, type=int)
-    parser.add_argument("--steps_per_epoch", default=500, type=int)
+    parser.add_argument("--steps_per_epoch", default = 100, type=int)
+    parser.add_argument("--divide", default = 2, type=int)
     parser.add_argument("--batch_size", default=2, type=int, help="batch size per device per step")
     parser.add_argument("--grad_accumulation_steps", default=10, type=int)
     parser.add_argument("--val_batch_size", default=1, type=int)
@@ -106,8 +113,11 @@ def parse_args(args):
                         help="Choose from: CocoCapVal, RefCOCOgRegVal, VisGenomeRegVal, RefCOCOgSegmVal, PsgGCGVal, "
                              "RefCocoGCGVal, FlickrGCGVal")
     parser.add_argument("--mask_validation", action="store_true")
+    parser.add_argument("--class_validation", action="store_true")
     parser.add_argument("--no_eval", action="store_true")
     parser.add_argument("--eval_only", action="store_true")
+    parser.add_argument("--inference", action="store_true")
+    parser.add_argument("--store_masks", action="store_true")
 
     # Experiment settings
     parser.add_argument("--log_base_dir", default="./output", type=str)
@@ -151,6 +161,7 @@ def setup_tokenizer_and_special_tokens(args):
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
     args.bop_token_idx = tokenizer("<p>", add_special_tokens=False).input_ids[0]
     args.eop_token_idx = tokenizer("</p>", add_special_tokens=False).input_ids[0]
+    print(args.seg_token_idx)
 
     return tokenizer
 
@@ -212,7 +223,7 @@ def prepare_model_for_training(model, tokenizer, args):
     for p in vision_tower.parameters():
         p.requires_grad = False
     for p in model.get_model().mm_projector.parameters():
-        p.requires_grad = False
+        p.requires_grad = True
 
     # Set requires_grad based on LoRA training
     lora_r = args.lora_r
@@ -265,7 +276,7 @@ def setup_lora_config(model, args):
 
 def set_trainable_modules(model):
     """ Make specified modules in the model trainable. """
-    trainable_modules = ["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs", "region_encoder"]
+    trainable_modules = ["lm_head", "embed_tokens", "mm_projector", "mask_decoder", "text_hidden_fcs", "region_encoder"]
     for name, param in model.named_parameters():
         if any(module in name for module in trainable_modules):
             print(f"Making trainable: {name}, Shape: {param.shape}")
@@ -280,7 +291,7 @@ def set_trainable_modules(model):
 
     count_parameters(model)
 
-
+# Here total dataset is loaded, in the dataset python file the embeddings are processed
 def initialize_datasets_and_loaders(args, tokenizer):
     world_size = torch.cuda.device_count()
     args.distributed = world_size > 1
@@ -329,8 +340,9 @@ def initialize_datasets_and_loaders(args, tokenizer):
                 elif seg_dataset_class == SemanticSegmDataset:
                     all_datasets = args.semantic_segm_data.split("||")
                     for d in all_datasets:
-                        dataset_class = seg_dataset_class(**common_ds_args, random_sampling=False, refer_segm_data=d)
-                        dataset_class._set_len(len(dataset_class.semantic_segm_data[d]['images']))
+                        # CHANGED
+                        dataset_class = seg_dataset_class(**common_ds_args, random_sampling=False, semantic_segm_data=d)
+                        dataset_class._set_len(len(dataset_class.data2list[d]))
                         train_datasets.append(dataset_class)
                 else:
                     train_datasets.append(seg_dataset_class(**common_ds_args))
@@ -350,6 +362,12 @@ def initialize_datasets_and_loaders(args, tokenizer):
     steps_per_epoch = total_length // effective_batch_size
     # modify steps per epoch
     args.steps_per_epoch = steps_per_epoch
+    # if not args.steps_per_epoch:
+    #     steps_per_epoch = total_length // effective_batch_size
+    #     # modify steps per epoch
+    #     args.steps_per_epoch = steps_per_epoch
+    # else:
+    #     steps_per_epoch = args.step_per_epoch // args.grad_accumulation_steps
 
     # Concatenating datasets
     train_dataset = torch.utils.data.ConcatDataset(train_datasets)
@@ -364,6 +382,8 @@ def initialize_datasets_and_loaders(args, tokenizer):
                                'PsgGCGVal': OpenPsgGCGDataset,
                                'RefCocoGCGVal': RefCOCOgGCGDataset,
                                'FlickrGCGVal': Flickr30kGCGDataset,
+                               "SemanticSegmVal": SemanticSegmDataset,
+                               'GranDfGCGVal': GranDfDataset,
                                }
         for val_dataset_name in args.val_dataset.split('|'):
             val_dataset_class = val_dataset_classes.get(val_dataset_name)
@@ -376,6 +396,14 @@ def initialize_datasets_and_loaders(args, tokenizer):
                         val_dataset_class = val_dataset_class(
                             **common_ds_args, validation=True, refer_segm_data=d, split='val')
                         val_dataset_class._set_len(len(val_dataset_class.refer_segm_data[d]['images']))
+                        val_datasets.append(val_dataset_class)
+                elif val_dataset_class == SemanticSegmDataset:
+                    semantic_segm_data = 'pancancer_val'
+                    all_datasets = semantic_segm_data.split("||")
+                    for d in all_datasets:
+                        val_dataset_class = val_dataset_class(
+                            **common_ds_args, validation=True, semantic_segm_data=d)
+                        val_dataset_class._set_len(len(val_dataset_class.data2list[d]))
                         val_datasets.append(val_dataset_class)
                 else:
                     val_datasets.append(val_dataset_class(**common_ds_args, validation=True))
@@ -407,7 +435,9 @@ def setup_data_loaders(args, train_dataset, val_datasets, tokenizer):
         )
 
     # Validation loader
+    
     val_loader = None
+
     if val_datasets:
         combined_val_datasets = ConcatDataset(val_datasets)
         val_loader = torch.utils.data.DataLoader(
@@ -439,6 +469,48 @@ def initialize_deepspeed(model, tokenizer, args):
 
     return model_engine, optimizer, scheduler
 
+def extract_part(filename):
+    # Pattern to capture parts with a follow-up exam
+    pattern_followup = r'PANCANCER_(\d+_\d+)_\d+\.'
+    # Pattern to capture parts without a follow-up exam
+    pattern_single = r'PANCANCER_(\d+)_\d+\.'
+    
+    match_followup = re.search(pattern_followup, filename)
+    match_single = re.search(pattern_single, filename)
+    
+    if match_followup:
+        return match_followup.group(1)
+    elif match_single:
+        return match_single.group(1)
+    return None
+
+
+
+def save_sam_and_clip_embeddings(model, data_loader, device, new_dir=False):
+    model.eval()  # Switch model to evaluation mode to prevent updating weights
+    created_directories = set()  # Keep track of created directories
+
+    with torch.no_grad():  # Ensure gradients are not computed
+        clip_cls_dir = "/data/groups/beets-tan/r.vt.hull/Semantic_Segm/pancancer_3D/train/clip2"
+        for data_batch in data_loader:
+            # if "/data/groups/beets-tan/r.vt.hull/Semantic_Segm/pancancer_totalseg/train/ct/PANCANCER_0944_389.npy" not in data_batch["image_paths"]:
+            #     continue
+            data_batch = dict_to_cuda(data_batch)
+            for key in ["global_enc_images", "grounding_enc_images"]:
+                if data_batch[key] is not None:
+                    data_batch[key] = data_batch[key].bfloat16()
+            global_embs_cls = model.global_encoding(data_batch["global_enc_images"].to(device), data_batch["offset"])
+            for image_path, global_embedding_cls in zip(data_batch["image_paths"], global_embs_cls):
+                basename = os.path.basename(image_path)  # e.g., 'PANCANCER_1138_275.npy'
+                patient_id = extract_part(basename)  # e.g., '1138'
+                filename_without_extension = os.path.splitext(basename)[0]  # Remove the extension
+                clip_cls_file_path = os.path.join(clip_cls_dir, filename_without_extension)
+
+                global_embedding_cls = global_embedding_cls.squeeze(1)
+                
+                torch.save(global_embedding_cls.cpu(), clip_cls_file_path)  # Save embedding to file
+
+    model.train()  # Switch back to training mode
 
 def resume_training_from_checkpoint(model_engine, args):
     if args.auto_resume and not args.resume:
@@ -458,14 +530,19 @@ def main(args):
     tokenizer = setup_tokenizer_and_special_tokens(args)
     model = initialize_model(args, tokenizer)
     prepare_model_for_training(model, tokenizer, args)
-
     train_dataset, val_datasets = initialize_datasets_and_loaders(args, tokenizer)
 
     model_engine, optimizer, scheduler = initialize_deepspeed(model, tokenizer, args)
     resume_training_from_checkpoint(model_engine, args)
 
     train_loader, val_loader = setup_data_loaders(args, train_dataset, val_datasets, tokenizer)
+
+    if args.compute_sam_and_clip:
+        save_sam_and_clip_embeddings(model_engine, train_loader, device=args.local_rank)
+        exit()
+
     dataset_iter = iter(train_loader)
+
 
     writer = initialize_environment(args)
 
@@ -475,28 +552,41 @@ def main(args):
 
     epoch_seeds = [random.randint(0, 100000) for _ in range(args.epochs)]
 
-    best_giou, best_ciou, best_val_loss = 0.0, 0.0, np.inf
+    best_giou, best_ciou, best_val_loss, best_dice, best_nsd = 0.0, 0.0, 0.0, 0.0, np.inf
     for epoch in range(args.start_epoch, args.epochs):
         random.seed(epoch_seeds[epoch])
 
         dataset_iter = train(train_loader, model_engine, epoch, scheduler, writer, dataset_iter, args)
+        #CHANGED to not evaluate
+        if not args.no_eval:
+            if args.mask_validation and not args.class_validation:
+                giou, ciou = validate_model_performance(val_loader, model_engine, epoch, writer, args)
+                is_best = giou > best_giou
+                best_giou = max(giou, best_giou)
+                best_ciou = ciou if is_best else best_ciou
+                if args.local_rank == 0:  # Log the progress
+                    print(f"Epoch: {epoch}, giou: {giou}, ciou: {ciou}, best_giou: {best_giou}, best_ciou: {best_ciou}")
+                save_checkpoint(model_engine, args, epoch, 'giou-ciou', f"{giou:.4f}-{ciou:.4f}", is_best)
+            
+            if args.mask_validation and args.class_validation:
+                giou, ciou, dice, nsd = validate_model_performance(val_loader, model_engine, epoch, writer, args)
+                is_best = dice > best_dice
+                best_dice = max(dice, best_dice)
+                best_nsd = nsd if is_best else best_nsd
+                if args.local_rank == 0:  # Log the progress
+                    print(f"Epoch: {epoch}, giou: {giou}, ciou: {ciou}, dice: {dice}, nsd:{nsd}, best_dice: {best_dice}, best_nsd: {best_nsd}")
+                save_checkpoint(model_engine, args, epoch, 'giou-ciou', f"{giou:.4f}-{ciou:.4f}-{dice:.4f}-{nsd:.4f}", is_best)
+            
+            else:
+                cur_val_loss = validate_model_performance(val_loader, model_engine, epoch, writer, args)
+                is_best = cur_val_loss < best_val_loss
+                best_val_loss = min(cur_val_loss, best_val_loss)
+                if args.local_rank == 0:  # Log the progress
+                    print(f"Epoch: {epoch}, Current Validation Loss: {cur_val_loss:.4f}, Best Validation Loss: {best_val_loss:}")
+                save_checkpoint(model_engine, args, epoch, 'loss', f"{cur_val_loss:.4f}", is_best)
 
-        if args.mask_validation:
-            giou, ciou = validate_model_performance(val_loader, model_engine, epoch, writer, args)
-            is_best = giou > best_giou
-            best_giou = max(giou, best_giou)
-            best_ciou = ciou if is_best else best_ciou
-            if args.local_rank == 0:  # Log the progress
-                print(f"Epoch: {epoch}, giou: {giou}, ciou: {ciou}, best_giou: {best_giou}, best_ciou: {best_ciou}")
-            save_checkpoint(model_engine, args, epoch, 'giou-ciou', f"{giou:.4f}-{ciou:.4f}", is_best)
         else:
-            cur_val_loss = validate_model_performance(val_loader, model_engine, epoch, writer, args)
-            is_best = cur_val_loss < best_val_loss
-            best_val_loss = min(cur_val_loss, best_val_loss)
-            if args.local_rank == 0:  # Log the progress
-                print(f"Epoch: {epoch}, Current Validation Loss: {cur_val_loss:.4f}, Best Validation Loss: {best_val_loss:}")
-            save_checkpoint(model_engine, args, epoch, 'loss', f"{cur_val_loss:.4f}", is_best)
-
+            print("No eval")
 
 def save_checkpoint(model_engine, args, epoch, metric_name, metric_value, is_best):
     """ Saves the model checkpoint. """
@@ -585,15 +675,50 @@ def train(data_loader, model, epoch, scheduler, writer, dataset_iter, args):
 
     return dataset_iter
 
+def surface_points(binary_mask):
+    eroded_mask = binary_erosion(binary_mask)
+    surface_mask = binary_mask & ~eroded_mask
+    return np.array(np.nonzero(surface_mask)).T
+
+def normalized_surface_distance(predicted_mask, ground_truth_mask):
+    if predicted_mask.sum() == 0 or ground_truth_mask.sum() == 0:
+        return np.nan
+    pred_surface = surface_points(predicted_mask)
+    gt_surface = surface_points(ground_truth_mask)
+    
+    d_pred_to_gt = distance_transform_edt(~ground_truth_mask)
+    d_gt_to_pred = distance_transform_edt(~predicted_mask)
+
+    if pred_surface.shape[1] == 3:
+        distances_pred_to_gt = d_pred_to_gt[pred_surface[:, 0], pred_surface[:, 1], pred_surface[:, 2]]
+    elif pred_surface.shape[1] == 2:
+        distances_pred_to_gt = d_pred_to_gt[pred_surface[:, 0], pred_surface[:, 1]]
+    
+    if gt_surface.shape[1] == 3:
+        distances_gt_to_pred = d_gt_to_pred[gt_surface[:, 0], gt_surface[:, 1], gt_surface[:, 2]]
+    elif gt_surface.shape[1] == 2:
+        distances_gt_to_pred = d_gt_to_pred[gt_surface[:, 0], gt_surface[:, 1]]
+    
+    nsd_pred_to_gt = np.mean(distances_pred_to_gt)
+    nsd_gt_to_pred = np.mean(distances_gt_to_pred)
+    
+    return (nsd_pred_to_gt + nsd_gt_to_pred) / 2
+
+def dice_score(pred, target):
+    intersection = (pred & target).sum().float()
+    union = pred.sum().float() + target.sum().float()
+    return 2 * intersection / (union + 1e-5)
+
 
 def validate_model_performance(validation_loader, training_model, current_epoch, tensorboard_writer, args):
-    if args.mask_validation:
+    if args.mask_validation and not args.class_validation:
         # For use with only segmentation/GCG type datasets
         trackers = {"intersection": AverageMeter("Intersec", ":.4f", Summary.SUM),
                     "union": AverageMeter("Union", ":.4f", Summary.SUM),
                     "gIoU": AverageMeter("gIoU", ":.4f", Summary.SUM)}
 
         training_model.eval()
+        mask_counter = 0
         for data_batch in tqdm.tqdm(validation_loader):
             # Prepare data and convert relevant tensors to bfloat16
             data_batch = dict_to_cuda(data_batch)
@@ -613,6 +738,13 @@ def validate_model_performance(validation_loader, training_model, current_epoch,
 
             intersection, union, accuracy_iou = 0.0, 0.0, 0.0
             for target, prediction in zip(gt_masks, predicted_masks):
+                prediction_cpu = prediction.cpu()
+                target_cpu = target.cpu()
+
+                # Convert the CPU tensors to NumPy arrays
+                prediction_np = prediction_cpu.numpy()
+                target_np = target_cpu.numpy()
+
                 intersect, union_, _ = intersectionAndUnionGPU(
                     prediction.contiguous().clone(), target.contiguous(), 2, ignore_index=255
                 )
@@ -641,6 +773,148 @@ def validate_model_performance(validation_loader, training_model, current_epoch,
             print("giou: {:.4f}, ciou: {:.4f}".format(global_iou, class_iou))
 
         return global_iou, class_iou
+    
+
+
+    elif args.mask_validation and args.class_validation:
+        # For use with only segmentation/GCG type datasets
+        trackers = {
+            "GCG": {
+                "intersection": AverageMeter("Intersec", ":.4f", Summary.SUM),
+                "union": AverageMeter("Union", ":.4f", Summary.SUM),
+                "gIoU": AverageMeter("gIoU", ":.4f", Summary.SUM),
+                "dice": AverageMeter("Dice", ":.4f", Summary.SUM),
+                "nsd": AverageMeter("NSD", ":.4f", Summary.SUM)
+            },
+            "SemSeg": {
+                "intersection": AverageMeter("Intersec", ":.4f", Summary.SUM),
+                "union": AverageMeter("Union", ":.4f", Summary.SUM),
+                "gIoU": AverageMeter("gIoU", ":.4f", Summary.SUM),
+                "dice": AverageMeter("Dice", ":.4f", Summary.SUM),
+                "nsd": AverageMeter("NSD", ":.4f", Summary.SUM)
+            },
+            "Total": {
+                "intersection": AverageMeter("Intersec", ":.4f", Summary.SUM),
+                "union": AverageMeter("Union", ":.4f", Summary.SUM),
+                "gIoU": AverageMeter("gIoU", ":.4f", Summary.SUM),
+                "dice": AverageMeter("Dice", ":.4f", Summary.SUM),
+                "nsd": AverageMeter("NSD", ":.4f", Summary.SUM)
+            }
+        }
+
+        if args.class_validation:
+            class_trackers = {}
+
+        training_model.eval()
+
+        for data_batch in tqdm.tqdm(validation_loader):
+            # Prepare data and convert relevant tensors to bfloat16
+            data_batch = dict_to_cuda(data_batch)
+            if "/" in data_batch["image_paths"][0]:
+                name = "GCG"
+            else:
+                name = "SemSeg"
+
+            for key in ["global_enc_images", "grounding_enc_images"]:
+                data_batch[key] = data_batch[key].bfloat16()
+            torch.cuda.empty_cache()
+            # Model inference without gradient tracking
+            with torch.no_grad():
+                results = training_model(**data_batch)
+
+            predictions = results["pred_masks"]
+            gt_masks = results["gt_masks"][0].int()
+            gt_labels = data_batch["sampled_classes_list"][0]
+            predicted_masks = (predictions[0] > 0).int()
+            assert len(predictions) == 1
+
+            intersection, union, accuracy_iou, dice_sum, nsd_sum = 0.0, 0.0, 0.0, 0.0, 0.0
+            for target, prediction, label in zip(gt_masks, predicted_masks, gt_labels):
+                intersect, union_, _ = intersectionAndUnionGPU(
+                    prediction.contiguous().clone(), target.contiguous(), 2, ignore_index=255
+                )
+                intersection += intersect
+                union += union_
+                accuracy_iou += intersect / (union_ + 1e-5)
+                # handles no-object targets
+                accuracy_iou[union_ == 0] += 1.0
+
+                # Calculate Dice score
+                dice = dice_score(prediction, target)
+                dice_sum += dice
+
+                # Calculate NSD
+                nsd = normalized_surface_distance(prediction.cpu().numpy(), target.cpu().numpy())
+                if not np.isnan(nsd):
+                    nsd_sum += nsd
+
+                if args.class_validation and name == "SemSeg":
+                    if label not in class_trackers:
+                        class_trackers[label] = {
+                            "intersection": 0.0, "union": 0.0, "accuracy_iou": 0.0,
+                            "dice_sum": 0.0, "nsd_sum": 0.0, "count": 0
+                        }
+                    class_trackers[label]["intersection"] += intersect
+                    class_trackers[label]["union"] += union_
+                    class_trackers[label]["accuracy_iou"] += intersect / (union_ + 1e-5)
+                    class_trackers[label]["dice_sum"] += dice
+                    if not np.isnan(nsd):
+                        class_trackers[label]["nsd_sum"] += nsd
+                    class_trackers[label]["count"] += 1
+
+            intersection, union = intersection.cpu().numpy(), union.cpu().numpy()
+            accuracy_iou = accuracy_iou.cpu().numpy() / gt_masks.shape[0]
+            trackers[name]["intersection"].update(intersection)
+            trackers[name]["union"].update(union)
+            trackers[name]["gIoU"].update(accuracy_iou, n=gt_masks.shape[0])
+            trackers[name]["dice"].update(dice_sum / gt_masks.shape[0], n=gt_masks.shape[0])
+            trackers[name]["nsd"].update(nsd_sum / gt_masks.shape[0], n=gt_masks.shape[0])
+
+            # Update total metrics
+            trackers["Total"]["intersection"].update(intersection)
+            trackers["Total"]["union"].update(union)
+            trackers["Total"]["gIoU"].update(accuracy_iou, n=gt_masks.shape[0])
+            trackers["Total"]["dice"].update(dice_sum / gt_masks.shape[0], n=gt_masks.shape[0])
+            trackers["Total"]["nsd"].update(nsd_sum / gt_masks.shape[0], n=gt_masks.shape[0])
+
+        for meter in trackers.values():
+            meter["intersection"].all_reduce()
+            meter["union"].all_reduce()
+            meter["gIoU"].all_reduce()
+            meter["dice"].all_reduce()
+            meter["nsd"].all_reduce()
+
+        for name, tracker in trackers.items():
+            iou_per_class = tracker["intersection"].sum / (tracker["union"].sum + 1e-10)
+            class_iou = iou_per_class[1]
+            global_iou = tracker["gIoU"].avg[1]
+            global_dice = tracker["dice"].avg
+            global_nsd = tracker["nsd"].avg
+
+            if args.local_rank == 0:
+                tensorboard_writer.add_scalar(f"val/{name}_giou", global_iou, current_epoch)
+                tensorboard_writer.add_scalar(f"val/{name}_ciou", class_iou, current_epoch)
+                tensorboard_writer.add_scalar(f"val/{name}_dice", global_dice, current_epoch)
+                tensorboard_writer.add_scalar(f"val/{name}_nsd", global_nsd, current_epoch)
+                print(f"{name} - giou: {global_iou:.4f}, ciou: {class_iou:.4f}, dice: {global_dice:.4f}, nsd: {global_nsd:.4f}")
+
+                if args.class_validation and name == "SemSeg":
+                    for class_label, metrics in class_trackers.items():
+                        avg_class_iou = (metrics["intersection"] / (metrics["union"] + 1e-10))[1]
+                        avg_class_giou = (metrics["accuracy_iou"] / metrics["count"])[1]
+                        avg_class_dice = metrics["dice_sum"] / metrics["count"]
+                        avg_class_nsd = metrics["nsd_sum"] / metrics["count"]
+                        tensorboard_writer.add_scalar(f"val/class_{class_label}_iou", avg_class_iou, current_epoch)
+                        tensorboard_writer.add_scalar(f"val/class_{class_label}_giou", avg_class_giou, current_epoch)
+                        tensorboard_writer.add_scalar(f"val/class_{class_label}_dice", avg_class_dice, current_epoch)
+                        tensorboard_writer.add_scalar(f"val/class_{class_label}_nsd", avg_class_nsd, current_epoch)
+                        print(f"class {class_label} - iou: {avg_class_iou:.4f}, giou: {avg_class_giou:.4f}, dice: {avg_class_dice:.4f}, nsd: {avg_class_nsd:.4f}")
+
+        # Return the metrics from the last validation loader processed
+        return global_iou, class_iou, global_dice, global_nsd
+
+
+    
     else:
         # Initializing performance trackers
         trackers = {"loss": AverageMeter("Loss", ":.4f"), "ce_loss": AverageMeter("CeLoss", ":.4f"),
@@ -656,15 +930,14 @@ def validate_model_performance(validation_loader, training_model, current_epoch,
             # Prepare data and convert relevant tensors to bfloat16
             data_batch = dict_to_cuda(data_batch)
             for key in ["global_enc_images", "grounding_enc_images"]:
-                if data_batch[key] is not None:
-                    data_batch[key] = data_batch[key].bfloat16()
+                data_batch[key] = data_batch[key].bfloat16()
             torch.cuda.empty_cache()
             # Model inference without gradient tracking
             with torch.no_grad():
                 predictions = training_model(**data_batch)
             # Update performance metrics)
             for key, tracker in trackers.items():
-                tracker.update(predictions[key].item(), data_batch["global_enc_images"].size(0))
+                tracker.update(predictions[key].item(), data_batch["grounding_enc_images"].size(0))
 
         # Synchronize metrics across processes
         for tracker in trackers.values():

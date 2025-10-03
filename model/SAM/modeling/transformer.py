@@ -99,6 +99,7 @@ class TwoWayTransformer(nn.Module):
         # Apply the final attention layer from the points to the image
         q = queries + point_embedding
         k = keys + image_pe
+        # (3, 6, 256) (3, 4096, 256) (3, 4096, 256)
         attn_out = self.final_attn_token_to_image(q=q, k=k, v=keys)
         queries = queries + attn_out
         queries = self.norm_final_attn(queries)
