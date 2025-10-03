@@ -27,10 +27,10 @@ class RegionCapDDP(Dataset):
 
 
 class GCGEvalDDP(Dataset):
-    def __init__(self, image_dir_path):
+    def __init__(self, image_dir_path, validation_files):
         self.image_dir_path = image_dir_path
-        self.image_ids = os.listdir(image_dir_path)
-
+        self.image_ids = [f for f in os.listdir(image_dir_path) if f in validation_files]
+        
     def __len__(self):
         return len(self.image_ids)
 

@@ -15,9 +15,9 @@ from model.GLaMM import GLaMMForCausalLM
 from model.llava import conversation as conversation_lib
 from model.llava.mm_utils import tokenizer_image_token
 from model.SAM.utils.transforms import ResizeLongestSide
-from tools.generate_utils import center_crop, create_feathered_mask
-from tools.utils import DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
-from tools.markdown_utils import (markdown_default, examples, title, description, article, process_markdown, colors,
+from utils.generate_utils import center_crop, create_feathered_mask
+from utils.utils import DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
+from utils.markdown_utils import (markdown_default, examples, title, description, article, process_markdown, colors,
                                   draw_bbox, ImageSketcher)
 
 
@@ -118,31 +118,33 @@ def region_enc_processor(orig_size, post_size, bbox_img):
 
 
 def prepare_mask(input_image, image_np, pred_masks, text_output, color_history):
-    save_img = None
+    save_img = image_np.copy()
     for i, pred_mask in enumerate(pred_masks):
         if pred_mask.shape[0] == 0:
             continue
         pred_mask = pred_mask.detach().cpu().numpy()
         mask_list = [pred_mask[i] for i in range(pred_mask.shape[0])]
         if len(mask_list) > 0:
-            save_img = image_np.copy()
             colors_temp = colors
             seg_count = text_output.count("[SEG]")
             mask_list = mask_list[-seg_count:]
             for curr_mask in mask_list:
                 color = random.choice(colors_temp)
-                if len(colors_temp) > 0:
+                if len(colors_temp) > 5:
                     colors_temp.remove(color)
                 else:
                     colors_temp = colors
                 color_history.append(color)
+
                 curr_mask = curr_mask > 0
-                save_img[curr_mask] = (image_np * 0.5 + curr_mask[:, :, None].astype(np.uint8) * np.array(color) * 0.5)[
-                    curr_mask]
+                contours, _ = cv2.findContours(curr_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(save_img, contours, -1, color, 2)  # 2 is the thickness of the contour line
+                
     seg_mask = np.zeros((curr_mask.shape[0], curr_mask.shape[1], 3), dtype=np.uint8)
     seg_mask[curr_mask] = [255, 255, 255]  # white for True values
     seg_mask[~curr_mask] = [0, 0, 0]  # black for False values
     seg_mask = Image.fromarray(seg_mask)
+    np.save("current", curr_mask.astype(int))
     mask_path = input_image.replace('image', 'mask')
     seg_mask.save(mask_path)
 
@@ -208,6 +210,26 @@ def inference(input_str, all_inputs, follow_up, generate):
 
     image_np = cv2.imread(input_image)
     image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+
+
+    # gray_image = np.load(input_image)
+
+
+    # gray_min = gray_image.min()
+    # gray_max = gray_image.max()
+    
+    # if gray_max == gray_min:
+    #     normalized_gray_image = np.zeros_like(gray_image)
+    # else:
+    #     normalized_gray_image = (gray_image - gray_min) * (255.0 / (gray_max - gray_min))
+    
+    # # Clip the values to be within the valid range and convert to uint8
+    # normalized_gray_image = np.clip(normalized_gray_image, 0, 255).astype(np.uint8)
+    
+    # # Assuming 'gray_image' is your grayscale image (2D array)
+    # rgb_image = np.expand_dims(normalized_gray_image, axis=-1)
+    # image_np = np.concatenate([rgb_image, rgb_image, rgb_image], axis=-1)
+
     orig_h, orig_w = image_np.shape[:2]
     original_size_list = [image_np.shape[:2]]
 
@@ -293,4 +315,4 @@ if __name__ == "__main__":
         description=description, article=article, theme=gr.themes.Soft(), examples=examples, allow_flagging="auto", )
 
     demo.queue()
-    demo.launch()
+    demo.launch(inbrowser=True)

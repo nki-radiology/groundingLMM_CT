@@ -13,7 +13,7 @@ from model.GLaMM import GLaMMForCausalLM
 from model.llava import conversation as conversation_lib
 from model.llava.mm_utils import tokenizer_image_token
 from model.SAM.utils.transforms import ResizeLongestSide
-from tools.utils import DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
+from utils.utils import DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
 
 
 def parse_args():
@@ -56,8 +56,25 @@ def inference(instructions, image_path):
     prompt = conv.get_prompt()
 
     # Read and preprocess the image (Global image encoder - CLIP)
-    image_np = cv2.imread(image_path)
-    image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+    # image_np = cv2.imread(image_path)
+    # image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+
+    gray_image = np.load(image_path)
+    gray_min = gray_image.min()
+    gray_max = gray_image.max()
+    
+    if gray_max == gray_min:
+        normalized_gray_image = np.zeros_like(gray_image)
+    else:
+        normalized_gray_image = (gray_image - gray_min) * (255.0 / (gray_max - gray_min))
+    
+    # Clip the values to be within the valid range and convert to uint8
+    normalized_gray_image = np.clip(normalized_gray_image, 0, 255).astype(np.uint8)
+    
+    # Assuming 'gray_image' is your grayscale image (2D array)
+    rgb_image = np.expand_dims(normalized_gray_image, axis=-1)
+    image_np = np.concatenate([rgb_image, rgb_image, rgb_image], axis=-1)
+
     original_size_list = [image_np.shape[:2]]
     image_clip = (clip_image_processor.preprocess(image_np, return_tensors="pt")["pixel_values"][0].unsqueeze(0).cuda())
     image_clip = image_clip.bfloat16()  # Precision is bf16 by default
@@ -76,7 +93,7 @@ def inference(instructions, image_path):
 
     # Generate output
     output_ids, pred_masks = model.evaluate(image_clip, image, input_ids, resize_list, original_size_list,
-                                            max_tokens_new=512, bboxes=bboxes)
+                                            max_tokens_new=1024, bboxes=bboxes)
     output_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]
 
     # Post-processing
@@ -143,14 +160,17 @@ if __name__ == "__main__":
     model.eval()  # Model should be in evaluation mode for inference
 
     # Prompt model to return grounded conversations
-    instruction = "Could you please give me a detailed description of the image? Please respond with interleaved \
+    instruction = "Could you please give me a detailed description of the CT scan? Please respond with interleaved \
     segmentation masks for the corresponding parts of the answer."
 
     # Create output directory if not exists already
     os.makedirs(args.output_dir, exist_ok=True)
 
+    with open('/projects/ct_vision_language/filenames_val_reports_4.json', 'r') as f:
+        validation_files = json.load(f)
+
     # Create DDP Dataset
-    dataset = GCGEvalDDP(args.img_dir)
+    dataset = GCGEvalDDP(args.img_dir, validation_files)
     distributed_sampler = DistributedSampler(dataset, rank=args.rank, shuffle=False)
     dataloader = DataLoader(dataset, batch_size=args.batch_size_per_gpu, num_workers=2,
                             sampler=distributed_sampler, collate_fn=custom_collate_fn)
