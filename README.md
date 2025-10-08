@@ -1,3 +1,6 @@
+# Thesis code
+This thesis has leveraged GLaMM to combine CT scans with radiology reports to generate grounded findings within CT scans. By training the model on reports linked to segmentations, the model is ulitmately able to generate a report with interleaved segmentation masks for each finding. Below is the explanation of the GLaMM model as described in the original paper.
+
 # GLaMM <img src="images/logos/face.png" height="40">: Pixel Grounding Large Multimodal Model
 <p align="center">
     <img src="https://i.imgur.com/waxVImv.png" alt="Oryx Video-ChatGPT">
