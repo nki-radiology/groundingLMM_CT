@@ -1,0 +1,15 @@
+[   "tumor", "enlarged lymph node" ,"lung tumor", 
+    "liver tumor", "abdominal tumor","bone tumor", 
+    "brain  tumor", "adrenal tumor",
+    "lung", "kidney", "rib", "vertebrae", "spleen", "gallbladder", 
+    "liver", "stomach", "pancreas", "adrenal_gland", "esophagus", 
+    "trachea", "thyroid_gland", "small_bowel", "duodenum", "colon", 
+    "urinary_bladder", "prostate", "kidney_cyst", "sacrum", "heart", 
+    "aorta", "pulmonary_vein", "brachiocephalic_trunk", "subclavian_artery", 
+    "common_carotid_artery", "brachiocephalic_vein", "atrial_appendage", 
+    "superior_vena_cava", "inferior_vena_cava", "portal_vein_and_splenic_vein", 
+    "iliac_artery", "iliac_vein", "humerus", "scapula", "clavicula", 
+    "femur", "hip", "spinal_cord", "gluteus_maximus", "gluteus_medius", 
+    "gluteus_minimus", "autochthon", "iliopsoas", "brain", "skull", 
+    "sternum", "costal_cartilages"
+]
